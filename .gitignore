@@ -1,5 +1,10 @@
-# Data (never commit raw or processed data)
-data/
+# Data (never commit raw or processed data; data/raw/ itself is kept via .gitkeep
+# so it exists after a clean clone — a bare "data/" pattern would also hide the
+# directory from the negation rules below, so this excludes contents instead)
+data/*
+!data/raw/
+data/raw/*
+!data/raw/.gitkeep
 
 # Environment
 .env
