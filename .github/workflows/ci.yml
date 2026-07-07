@@ -1,16 +1,18 @@
 name: CI
 
 on:
+  # push only on main: a feature branch with an open PR is already covered by
+  # the pull_request trigger, so restricting push here stops the same commit
+  # from running CI twice (once for push, once for pull_request). Feature
+  # branches get CI as soon as a PR is opened; merges to main re-run it.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-    branches: ["main"]
+    branches: [main]
 
-# A push to a branch with an open PR against main fires both triggers above
-# for the same commit; group by branch so the newer run cancels the older
-# one instead of both running to completion.
+# Cancel superseded runs when a PR is updated with a rapid second push.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
