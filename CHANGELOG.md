@@ -27,3 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   typed `staging.purchase_orders` with a per-column hard/soft cast-error
   policy and `staging.rejected_rows`, truncate-and-reload idempotency, and
   a reconciliation check enforced at load time.
+- Transform layer (`sql/20_transform`, new `transform` schema): row-level
+  enrichment flags (`is_credit`, `is_zero_price`, `is_price_outlier` at the
+  dynamic 99.9th percentile, `price_consistency_flag`, `is_exact_duplicate`
+  + `dup_occurrence`, `fiscal_year_mismatch`, `purchase_date_out_of_range`),
+  canonical supplier names, a UNION-sourced UNSPSC code dimension with
+  digit-derived hierarchy and majority-vote titles, and an exploded
+  classification-code bridge source (distinct per line/code). Verified
+  against the real dataset (e.g. 3,392 exact duplicates, 0 bridge orphans)
+  and the synthetic fixture via a shared testcontainers integration test.

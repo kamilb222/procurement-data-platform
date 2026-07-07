@@ -73,9 +73,9 @@ procurement-data-platform/
 │   ├── download_data.md       # manual download instructions with URL + expected filename + row count
 │   └── run_pipeline.py        # CLI entry: python scripts/run_pipeline.py [--stage staging|transform|marts|all]
 ├── sql/
-│   ├── 00_init/               # schema creation: raw, staging, marts schemas
+│   ├── 00_init/               # schema creation: raw, staging, transform, marts schemas
 │   ├── 10_staging/            # typed, cleaned copies of raw tables
-│   ├── 20_transform/          # deduplication, supplier name normalization, derived columns
+│   ├── 20_transform/          # -> transform schema: dedup markers, supplier/UNSPSC canonical maps, derived flags, bridge source
 │   └── 30_marts/              # star schema: fact_purchase_orders + dim_supplier, dim_department, dim_unspsc, dim_date
 ├── src/
 │   └── pdp/                   # importable package
@@ -135,9 +135,9 @@ procurement-data-platform/
 ### Task order
 1. **Scaffolding:** repo layout above, docker-compose with Postgres 16 (named volume, healthcheck), pyproject, ruff, pre-commit, CI workflow, `.env.example` (DB credentials, ports).
 2. **Data profiling script** (`scripts/profile_raw.py`): load the raw CSV with pandas (`dtype=str`, no type inference), output a markdown profile to `docs/data_profile.md`: per-column null %, distinct counts, min/max, top-10 values, detected format anomalies. **Stop after this step and show the human the profile** — the concrete cleaning rules in step 4 must be agreed based on real findings, not assumptions.
-3. **Load layer:** `sql/00_init` creates schemas `raw`, `staging`, `marts`. Loader copies the CSV into `raw.purchase_orders` verbatim (all TEXT columns) using `COPY`. Log row count.
+3. **Load layer:** `sql/00_init` creates schemas `raw`, `staging`, `transform`, `marts`. (The `transform` schema was added in step 5 — see the note there — so this list has four schemas, not the three in the original draft.) Loader copies the CSV into `raw.purchase_orders` verbatim (all TEXT columns) using `COPY`. Log row count.
 4. **Staging layer** (`sql/10_staging`): typed casts with explicit failure handling (rows that fail casts go to `staging.rejected_rows` with a reason column — never silently drop), date parsing, money parsing, trimming, canonical casing.
-5. **Transform layer** (`sql/20_transform`): dedup PO line items (define and document the uniqueness key), supplier name normalization (same supplier code → one canonical name; document the chosen strategy, e.g. most frequent variant), derived columns (fiscal year check, price sanity flags).
+5. **Transform layer** (`sql/20_transform` → **`transform` schema**): dedup PO line items (define and document the uniqueness key), supplier name normalization (same supplier code → one canonical name; document the chosen strategy, e.g. most frequent variant), derived columns (fiscal year check, price sanity flags). **Schema note:** the intermediate enrichment outputs (row-level flag table, supplier/UNSPSC canonical maps, classification-code bridge source) live in a dedicated `transform` schema — added beyond the three schemas in the original §4 draft — so `staging` stays a clean typed mirror and `marts` a pure dimensional model. This deviation was agreed with the human; see `docs/cleaning_rules.md` for the details.
 6. **Marts layer** (`sql/30_marts`): star schema — `fact_purchase_orders`, `dim_supplier`, `dim_department`, `dim_unspsc`, `dim_date`. Document grain in each file header. Add useful analytical views (spend by department/quarter, top suppliers, acquisition-method breakdown).
 7. **Validation module** (`src/pdp/validation/`): rule-based checks that run post-pipeline and produce `docs/data_quality_report.md` + non-zero exit code on hard failures. Checks: row-count reconciliation between layers, referential integrity fact→dims, no negative totals in fact, date ranges within FY2012–2015, duplicate-key check, null thresholds per critical column. Design it as a small declarative framework (list of Check objects), not ad-hoc asserts — this is a portfolio highlight.
 8. **Tests:** unit tests for parsers/normalizers with synthetic fixtures; integration test running the whole pipeline on a 200-row synthetic CSV inside a test schema/container.

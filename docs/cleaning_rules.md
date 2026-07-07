@@ -30,11 +30,18 @@ don't silently deviate.
   (a purchase can predate its entry into SCPRS). Parse it, allow null, and
   do **not** reject dates before 2012.
 - AGENTS.md's validation rule "date ranges within FY2012–2015" is narrowed
-  to **`Creation Date` only** (hard check). Add a separate **soft check**
-  that `Creation Date`'s year is consistent with the `Fiscal Year` column.
-- `Purchase Date` gets sanity checks only, as flags, never rejections: not
-  before 2000, and not after `Creation Date` plus a tolerance. Deviations
-  are flagged, not dropped.
+  to **`Creation Date` only** (hard check). A separate **soft check**
+  (`fiscal_year_mismatch` in `transform.purchase_orders_enriched`) compares
+  `creation_date`'s CA fiscal year (Jul–Jun) to the `Fiscal Year` column.
+  **Verified: 0 mismatches** — the `Fiscal Year` column is fully derivable
+  from `creation_date` across all 344,504 rows (e.g. Aug 2013 and Jan 2014
+  both → "2013-2014").
+- `Purchase Date` gets sanity checks only, as flags, never rejections
+  (`purchase_date_out_of_range`): before 2000-01-01, or more than one year
+  after `creation_date`. **Verified: 447 rows flagged** — including the
+  parsed extremes 1911-10-01 and **6070-12-10** (both valid `M/D/YYYY`
+  strings, nonsensical years) that the staging cast accepts but this flag
+  catches.
 
 ## b. Prices (`Unit Price`, `Total Price`)
 
@@ -44,38 +51,69 @@ don't silently deviate.
   `is_credit` flag in the transform layer.
 - Zero prices (~7,500 rows): **keep**, flag `is_zero_price`.
 - Outliers (e.g. the billion-dollar contracts, see finding in
-  `data_profile.md`): **do not remove or clip**. In transform, add:
-  - `is_price_outlier` — `Total Price` above the 99.9th percentile.
-  - A consistency check flagging rows where
-    `|Quantity × Unit Price − Total Price|` exceeds a tolerance.
-  - Once step 5 implements this, record the exact percentile cutoff and
-    tolerance value used here.
+  `data_profile.md`): **do not remove or clip**. Implemented in
+  `transform.purchase_orders_enriched`:
+  - `is_price_outlier` — `total_price` above the 99.9th percentile,
+    computed dynamically each run via `percentile_cont(0.999)`. **Verified
+    current value: $55,000,000, flagging 344 rows.** (Dynamic so the flag
+    tracks the data if a future export shifts the distribution; the current
+    value is recorded here for reference.)
+  - `price_consistency_flag` — rows where
+    `|quantity × unit_price − total_price| > 0.01 + 0.005 × |total_price|`
+    (1 cent absolute + 0.5% relative tolerance), only when all three values
+    are present. **Verified: 1,308 rows flagged.**
+  - `is_credit` — `total_price < 0`. **Verified: 1,438 rows** (the same
+    accounting-negative values from profiling).
+  - `is_zero_price` — `total_price = 0`. **Verified: 7,511 rows.**
 
 ## c. Duplicate rows (3,392 exact duplicates, 0.98%)
 
 - There is no line-item identifier in the source data, so a *technical*
   duplicate (re-extracted row) cannot be distinguished from a *legitimately*
   repeated order line.
-- **Decision: do not delete.** In transform, add:
-  - `is_exact_duplicate` flag.
-  - An occurrence number (`row_number()` over the set of identical rows).
+- **Decision: do not delete.** Implemented in
+  `transform.purchase_orders_enriched`:
+  - `is_exact_duplicate` flag. **Verified: 3,392 rows** — the duplicate key
+    is the full set of *raw* columns (detection joins back to
+    `raw.purchase_orders`), so the count reproduces profiling's raw-CSV
+    measurement exactly rather than drifting on staging's cleaned values.
+  - `dup_occurrence` — 1-based `row_number()` within each identical group,
+    ordered by `raw_row_id`. **Verified: 2,087 rows have occurrence > 1**
+    (i.e. an analyst keeping only occurrence = 1 would drop 2,087 rows).
 - Analytical views and docs must note that spend totals are computed over
   the *full* dataset by default; the flag lets an analyst deliberately
   exclude duplicates when that's the right call for their question.
 
 ## d. Classification Codes (multi-UNSPSC, 58,602 rows)
 
-- The canonical single code for `fact_purchase_orders` / `dim_unspsc` is
-  **`Normalized UNSPSC`**.
+- The canonical single code for `fact_purchase_orders` is
+  **`normalized_unspsc`**.
 - `Classification Codes` (which packs several newline-separated UNSPSC
-  codes into one field — confirmed up to 13 codes in one row) is split
-  into a bridge table `bridge_po_classification` (fact line → code), so
-  the extra codes aren't discarded.
-- `dim_unspsc`'s hierarchy (segment/family/class/commodity) is built from
-  the codes; titles are resolved by **majority vote** per code (the raw
-  title columns contain truncated garbage in some rows, e.g. "lized trade
-  construction and maintenance services" — majority vote fixes most of
-  these). Codes with no clear majority are flagged.
+  codes into one field — confirmed up to 13 codes in one row) is exploded
+  in `transform.po_classification` (line → code, **distinct per
+  `(raw_row_id, code)`** so a code repeated within one field can't inflate
+  bridge joins), feeding `marts.bridge_po_classification`. **Verified:
+  539,420 (line, code) pairs across 16,709 distinct codes.**
+- `transform.unspsc_codes` (source for `dim_unspsc`) is built from the
+  **UNION** of `normalized_unspsc` and every code from `Classification
+  Codes`, so the bridge always has a valid parent. **Verified: 16,710
+  codes total (13,405 `from_normalized`, 3,305 `code_only`), 0 bridge
+  orphans.** A normalized-only dimension would have orphaned the
+  `code_only` codes.
+- Hierarchy (segment/family/class) is **derived from the code digits**,
+  which profiling verified is reliable (class/segment: 0 mismatches vs the
+  provided columns; family: 28 of 343,469). Derived only for full 8-digit
+  codes — **63 codes are not 8 digits** (18 short `normalized_unspsc`
+  values + 45 short classification codes) and get NULL hierarchy, flagged
+  by `is_full_code`.
+- Titles are resolved by **majority vote (`mode()`) per code**. **Verified
+  nuance:** at the 8-digit commodity-code grain every title is already
+  unambiguous (`title_has_majority` is true for all codes) — the truncated
+  garbage (e.g. "lized trade construction and maintenance services") is a
+  disagreement *between* codes sharing a `family_code`, not *within* a
+  code. So the majority vote actually matters when `dim_unspsc` picks a
+  single `family_title`/`segment_title` per `family_code`/`segment_code`
+  (step 6), and only for the 3 affected families.
 
 ## e. Location (`zip\n(lat, lon)`) and `Supplier Zip Code`
 
@@ -142,7 +180,16 @@ don't silently deviate.
 
 ## h. `dim_supplier`
 
-- Grain: **`Supplier Code`**.
+- Grain: **`supplier_code`**. `transform.supplier_canonical` resolves one
+  canonical name per code. AGENTS.md's "most frequent variant" strategy is
+  implemented with `mode()` but is empirically a **no-op**: profiling
+  verified 0 of 25,235 codes carry more than one distinct name.
+- **No fabricated labels (verified).** `supplier_code` `'0'` is *not*
+  relabelled by us — it legitimately carries the real name **"Unknown"** in
+  the source (all 4,473 rows with code `'0'` have name "Unknown"). No code
+  in the data has only-null names, so a fallback label is never invented.
+  The **36 rows with a NULL `supplier_code`** get no `dim_supplier` row and
+  a NULL supplier FK in the fact — again, nothing fabricated.
 - Known limitation to document: profiling confirms **438 of 24,728**
   distinct Supplier Names map to more than one Supplier Code (e.g. "Pitney
   Bowes" appears under 7 different codes) — almost certainly the same
@@ -150,6 +197,21 @@ don't silently deviate.
   as "~500"; 438 is the verified count from this dataset.)
   Fuzzy deduplication across codes is explicitly **out of scope** for
   Stage 1.
+
+## Transform layer (`sql/20_transform`) — schema and outputs
+
+- A dedicated **`transform` schema** (added to `sql/00_init`) holds the
+  intermediate enrichment, keeping `staging` a clean typed mirror and
+  `marts` a pure dimensional model. This is a deliberate deviation from
+  AGENTS.md section 4's three-schema list, agreed with the owner.
+- Outputs (all truncate-and-reload, same idempotency contract as staging):
+  - `transform.supplier_canonical` — code → canonical name (rule h).
+  - `transform.unspsc_codes` — UNION-sourced code dimension with derived
+    hierarchy and majority-vote titles (rule d).
+  - `transform.purchase_orders_enriched` — additive row-level flags (rules
+    a, b, c); one row per staging row, joined to the fact on `raw_row_id`.
+  - `transform.po_classification` — exploded (line → code) bridge source
+    (rule d).
 
 ## Staging pipeline mechanics (agreed for `sql/00_init` / `sql/10_staging`)
 
