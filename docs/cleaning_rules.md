@@ -213,6 +213,39 @@ don't silently deviate.
   - `transform.po_classification` — exploded (line → code) bridge source
     (rule d).
 
+## Marts layer (`sql/30_marts`) — star schema
+
+Star schema built from staging + transform; all tables truncate-and-reload.
+**Key strategy is mixed by column shape** (agreed): natural keys where they
+are already compact (`supplier_code`, `unspsc_code`, dates), a surrogate
+`department_key` for the long department name.
+
+| Table | Grain | Notes |
+|---|---|---|
+| `dim_date` | one calendar date | 2000-01-01 … 2016-06-30; CA fiscal-year (Jul–Jun) attributes. **6,026 rows.** |
+| `dim_department` | one department | surrogate `department_key`; **111 rows**, no null member. |
+| `dim_supplier` | one `supplier_code` | enriched with `supplier_zip5`/`is_foreign_zip`/`location_lat`/`location_lon` (each verified single-valued per code). **25,235 rows.** |
+| `dim_unspsc` | one UNSPSC code | `family_title`/`segment_title` majority-voted at `family_code`/`segment_code` grain (verified: 0 families with >1 title afterward). **16,710 rows.** |
+| `fact_purchase_orders` | one accepted PO line (`raw_row_id`) | 1:1 with staging. **344,504 rows, 0 dangling FKs.** |
+| `bridge_po_classification` | one (line, UNSPSC code) | FK to fact and `dim_unspsc`. **539,420 rows.** |
+
+- **`supplier_qualifications` stays on the fact** (degenerate), not in
+  `dim_supplier`: verified it varies within a `supplier_code` (1,231 codes
+  have >1 value), unlike zip/location which are single-valued per code.
+- **`purchase_date_key` FK policy:** NULL when `purchase_date` is NULL
+  (17,421 rows) **or** falls outside `dim_date`'s coverage (300 rows, e.g.
+  the parsed 1911 and 6070 dates) — **17,721 NULL keys total**. This is a
+  coverage/join concern, distinct from the business flag
+  `purchase_date_out_of_range` (447 rows) carried as a fact column; the
+  300 out-of-coverage rows are a subset of the 447. `creation_date_key` is
+  never NULL (2012–2015 is fully inside coverage).
+- **Analytical views** (`marts.v_*`), spend = `SUM(total_price)` over the
+  full fact by default (net of credits, duplicates included; flags let an
+  analyst re-slice): `v_spend_by_department_quarter`,
+  `v_spend_by_fiscal_year`, `v_top_suppliers` (`po_count` =
+  `COUNT(DISTINCT purchase_order_number)`, not line count),
+  `v_spend_by_acquisition_method`, `v_spend_by_unspsc_segment`.
+
 ## Staging pipeline mechanics (agreed for `sql/00_init` / `sql/10_staging`)
 
 ### Per-column cast error policy
@@ -246,10 +279,16 @@ database must be deterministic, not additive:
   `COPY`. `CASCADE` also empties `staging.purchase_orders` and
   `staging.rejected_rows` (they hold FKs to `raw_row_id`), so the raw
   reload can never fail on a stale FK from a previous staging run.
-- **staging:** `TRUNCATE staging.purchase_orders, staging.rejected_rows`
-  at the top of `03_purchase_orders_load.sql` regardless (belt-and-suspenders
-  — makes the staging script correctly idempotent even if run on its own,
-  without depending on the raw step having just run).
+- **staging:** `TRUNCATE staging.purchase_orders CASCADE` (plus
+  `staging.rejected_rows`) at the top of `03_purchase_orders_load.sql`
+  regardless (belt-and-suspenders — makes the staging script correctly
+  idempotent even if run on its own, without depending on the raw step
+  having just run). **`CASCADE` is required, not just tidy:** once the
+  transform and marts layers exist they carry FKs back to
+  `staging.purchase_orders`, and Postgres refuses to `TRUNCATE` a
+  referenced table even when the referrers are empty. The cascade
+  re-clears the whole downstream chain, which is the correct behavior —
+  a staging reload invalidates everything built on top of it.
 - `raw_row_id` is a `BIGSERIAL` reset by `RESTART IDENTITY` on every raw
   reload, so it's stable and equal to the row's 1-indexed position in the
   current CSV (header excluded) across reruns of the same file.
