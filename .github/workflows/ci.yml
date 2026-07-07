@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["main"]
 
+# A push to a branch with an open PR against main fires both triggers above
+# for the same commit; group by branch so the newer run cancels the older
+# one instead of both running to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
