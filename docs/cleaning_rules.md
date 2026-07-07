@@ -77,14 +77,36 @@ don't silently deviate.
   construction and maintenance services" — majority vote fixes most of
   these). Codes with no clear majority are flagged.
 
-## e. Location (`zip\n(lat, lon)`)
+## e. Location (`zip\n(lat, lon)`) and `Supplier Zip Code`
 
-- Split in staging into `location_zip`, `location_lat`, `location_lon`.
-- Zip codes are normalized to 5 digits into `supplier_zip5` (stripping any
-  ZIP+4 suffix); the raw value is kept alongside it.
+- **Verified finding:** `Supplier Zip Code` and `Location` are redundant.
+  Checked row-for-row on the real dataset:
+  - Of the 274,424 rows where both are present, the zip embedded in
+    `Location` matches `Supplier Zip Code` **exactly, in all 274,424
+    rows** (0 mismatches).
+  - Every distinct zip maps to exactly **one** `(lat, lon)` pair (0 of
+    3,993 zips have more than one) — `Location`'s coordinates are a
+    deterministic **zip-code centroid lookup**, not a per-supplier
+    geocoded address.
+  - The two columns are null/non-null in perfect lockstep (0 rows have
+    one present and the other missing).
+  - **Implication for Power BI (Stage 2):** any map built from these
+    coordinates plots zip-code centroids, not actual supplier locations —
+    multiple suppliers in the same zip will stack on identical points.
+    Document this caveat on any map visual.
+- `Location` is split in staging into `location_zip`, `location_lat`,
+  `location_lon` — a plain split of the composite field, no extra
+  normalization applied.
+- Separately, `supplier_zip_code` (the authoritative source, given the
+  finding above) is normalized to 5 digits into `supplier_zip5` (stripping
+  any ZIP+4 suffix); the raw value is kept alongside it as
+  `supplier_zip_code_raw`.
 - Values that don't match the US zip pattern (e.g. the Canadian `n6b1y8`
   seen in profiling) are legitimate foreign addresses: flag
-  `is_foreign_zip`, never reject.
+  `is_foreign_zip`, never reject. The flag is computed explicitly per row
+  in the staging load (`!~ '^\d{5}(-\d{4})?$'`); the column's `DEFAULT
+  false` is only a safety net for hypothetical future manual inserts, not
+  the mechanism that sets the value.
 
 ## f. Mojibake (double-encoded UTF-8)
 
@@ -92,6 +114,20 @@ don't silently deviate.
   `convert_from(convert_to(col, 'LATIN1'), 'UTF8')`, applied **only** to
   values matching the mojibake pattern, wrapped in a function with a
   fallback to the original value if the conversion errors.
+- **Verified finding:** some values are **double-encoded** (the mistake
+  happened twice upstream, e.g. `17.25Ã¢Â\x80Â\x9d` for the intended
+  `17.25"`). A single round-trip only peels off one layer and leaves a
+  still-mangled result, so `staging.repair_mojibake` iterates the
+  round-trip until the pattern stops matching or the result stops
+  changing, capped at 5 iterations.
+- **Known residual (5 rows, unrecoverable):** a handful of values contain
+  a truncated/orphaned mojibake byte sequence (e.g. a lone `Â` with no
+  continuation bytes, likely from a source-side field-length truncation).
+  These can never round-trip back to valid UTF-8 — the function correctly
+  leaves them unchanged rather than guessing at the lost bytes. This is a
+  real, permanent data-quality limitation of the source file, not a repair
+  bug; document it as a finding in `docs/data_quality_report.md`, not a
+  silent gap.
 - Count repaired rows and report them in `docs/data_quality_report.md`.
 - Caveat carried over from profiling: the detection pattern is a heuristic
   and can false-positive on legitimate accented text (e.g. "Château") — the
@@ -114,3 +150,54 @@ don't silently deviate.
   as "~500"; 438 is the verified count from this dataset.)
   Fuzzy deduplication across codes is explicitly **out of scope** for
   Stage 1.
+
+## Staging pipeline mechanics (agreed for `sql/00_init` / `sql/10_staging`)
+
+### Per-column cast error policy
+
+General rule: **null passes through; garbage gets rejected.** A row is a
+**hard reject** (excluded from `staging.purchase_orders`, one row written to
+`staging.rejected_rows` with a reason) only when one of these is true:
+
+| Column | Hard reject when | Soft (never rejects) |
+|---|---|---|
+| `creation_date` | non-null and doesn't match `M/D/YYYY` | — (never null in source) |
+| `purchase_date` | non-null and doesn't match `M/D/YYYY` | null |
+| `calcard` | non-null and not in `{YES, NO}` | — (never null in source) |
+| `quantity` | non-null and not numeric | null |
+| `unit_price` | non-null and not parseable by `staging.parse_money` | null |
+| `total_price` | non-null and not parseable by `staging.parse_money` | null |
+| every other column (all descriptive/text fields) | never | anything, including null |
+
+Profiling found ~0 rows that would actually trip these hard checks today —
+the rule exists so a regression in a future data export (e.g. a genuinely
+malformed date) is caught loudly instead of silently corrupting
+`staging.purchase_orders`. If a rejected row fails more than one check, its
+`reason` lists all of them (semicolon-joined), not just the first.
+
+### Idempotency: truncate-and-reload
+
+Re-running `python scripts/run_pipeline.py --stage all` against an existing
+database must be deterministic, not additive:
+
+- **raw:** `TRUNCATE raw.purchase_orders RESTART IDENTITY CASCADE` before
+  `COPY`. `CASCADE` also empties `staging.purchase_orders` and
+  `staging.rejected_rows` (they hold FKs to `raw_row_id`), so the raw
+  reload can never fail on a stale FK from a previous staging run.
+- **staging:** `TRUNCATE staging.purchase_orders, staging.rejected_rows`
+  at the top of `03_purchase_orders_load.sql` regardless (belt-and-suspenders
+  — makes the staging script correctly idempotent even if run on its own,
+  without depending on the raw step having just run).
+- `raw_row_id` is a `BIGSERIAL` reset by `RESTART IDENTITY` on every raw
+  reload, so it's stable and equal to the row's 1-indexed position in the
+  current CSV (header excluded) across reruns of the same file.
+
+### Reconciliation check, enforced at load time
+
+`03_purchase_orders_load.sql` ends with a `DO $$ ... $$` block asserting
+`count(raw.purchase_orders) = count(staging.purchase_orders) +
+count(staging.rejected_rows)`, raising a Postgres exception (failing the
+whole script) if it doesn't hold. This is the same invariant Stage 1 step 7
+validation will check again at the reporting level — checking it here too
+means an `INSERT ... SELECT` bug is caught the moment it's introduced, not
+three steps later when the validation report runs.
