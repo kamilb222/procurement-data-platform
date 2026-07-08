@@ -36,3 +36,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   classification-code bridge source (distinct per line/code). Verified
   against the real dataset (e.g. 3,392 exact duplicates, 0 bridge orphans)
   and the synthetic fixture via a shared testcontainers integration test.
+- Marts layer (`sql/30_marts`): star schema — `dim_date` (CA fiscal-year
+  attributes), `dim_department`, `dim_supplier` (enriched with per-code
+  zip/centroid), `dim_unspsc` (family/segment titles majority-voted at
+  their own grain), `fact_purchase_orders` (mixed natural/surrogate keys,
+  NULL-FK policy for out-of-coverage purchase dates), a bridge to all
+  UNSPSC classification codes, and five analytical views (spend by
+  department/quarter, fiscal year, top suppliers, acquisition method, and
+  UNSPSC segment). Verified end-to-end (344,504 fact rows, 0 dangling FKs).
+
+### Fixed
+
+- Staging load now `TRUNCATE`s `staging.purchase_orders` with `CASCADE`, so
+  the pipeline stays idempotent on re-run once the transform/marts layers
+  carry FKs back to staging (Postgres refuses to truncate a referenced
+  table otherwise).

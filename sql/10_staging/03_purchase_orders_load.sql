@@ -20,7 +20,12 @@
 -- has no effect on the current dataset.
 
 TRUNCATE TABLE staging.rejected_rows;
-TRUNCATE TABLE staging.purchase_orders;
+-- CASCADE because downstream layers (transform.*, marts.fact/bridge) carry
+-- FKs back to staging.purchase_orders; a reload here invalidates them, so
+-- clearing them in the same statement keeps the whole pipeline idempotent.
+-- (TRUNCATE refuses on a referenced table even when the referrers are empty,
+-- so CASCADE is required, not just tidy.)
+TRUNCATE TABLE staging.purchase_orders CASCADE;
 
 WITH parsed AS (
     SELECT
